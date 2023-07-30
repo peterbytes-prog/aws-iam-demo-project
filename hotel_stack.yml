@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Hotel Website"
+Parameters:
+
+  VpcCIDR:
+    Default: 10.32.0.0/16
+    Description: "The CIDR block for the VPC"
+    Type: String
+    AllowedValues:
+      - 10.32.0.0/16
+
+  SubnetCIDR:
+    Default: 10.32.0.0/24
+    Description: "CIDR for public subnet"
+    Type: String
+    AllowedValues:
+      - 10.32.0.0/24
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+       - Key: Name
+         Value: "Hotel IAM VPC"
+
+  subnet:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+     VpcId: !Ref VPC
+     AvailabilityZone:
+      Fn::Select:
+      - 0
+      - Fn::GetAZs: ''
+     CidrBlock: !Ref SubnetCIDR
+     MapPublicIpOnLaunch: true
+     Tags:
+      - Key: Name
+        Value: "Hotel IAM subnet"
+
+  IGW:
+    Type: "AWS::EC2::InternetGateway"
+    DependsOn: VPC
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    DependsOn:
+      - VPC
+      - IGW
+    Properties:
+     VpcId: !Ref VPC
+     InternetGatewayId: !Ref IGW
+
+  ec2Route:
+    Type: "AWS::EC2::RouteTable"
+    DependsOn:
+      - VPC
+      - AttachGateway
+    Properties:
+      VpcId: !Ref VPC
+
+  routeOut:
+    Type: "AWS::EC2::Route"
+    DependsOn:
+      - ec2Route
+      - AttachGateway
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+      RouteTableId: !Ref ec2Route
+
+  SubnetRouteAssociate:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    DependsOn:
+      - ec2Route
+      - subnet
+    Properties:
+      RouteTableId: !Ref ec2Route
+      SubnetId: !Ref subnet
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+      - "-"
+      - - "pr-photo-bucket"
+        - !Select
+          - 0
+          - !Split
+            - "-"
+            - !Select
+              - 2
+              - !Split
+                - "/"
+                - !Ref "AWS::StackId"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          Action:
+            - s3:GetObject
+          Effect: Allow
+          Principal: "*"
+          Resource:
+            - !Sub "arn:aws:s3:::${S3Bucket}/*"
+            - !Sub "arn:aws:s3:::${S3Bucket}"
+
+  S3Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: t2.micro
+      SubnetId: !Ref subnet
+      IamInstanceProfile: !Ref S3CopyProfile
+      ImageId: !Ref LatestAmiId
+      UserData:
+        Fn::Base64:
+          !Sub |
+          #!/bin/bash -xe
+          export bucket=`aws s3api list-buckets --query "Buckets[].Name" | grep pr-photo-bucket | tr -d ',' | sed -e 's/"//g' | xargs`
+          wget https://aws-tc-largeobjects.s3-us-west-2.amazonaws.com/DEV-AWS-MO-Identity/index.html
+          sed -i "s/<FMI_1>/$bucket/g" index.html
+          aws s3 cp index.html s3://${S3Bucket}/index.html
+
+  S3CopyProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: S3CopyRole
+  S3CopyPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: S3CopyPolicy
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:ListBucket
+          - s3:PutObject
+          - s3:GetObject
+          - s3:PubObjectAcl
+          - s3:ListAllMyBuckets
+          Resource: '*'
+      Roles:
+      - Ref: S3CopyRole
+  S3CopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+
+  SysAdmin:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: SysAdmins
+
+  SysAdminPolicy: # programmers role authorize all ec2 activity for all existing ec2's
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: SysAdmin
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ec2:*'
+            Resource: '*' #todo limit instance to project/stack instances only
+      Groups:
+        - !Ref SysAdmin
+
+  Jane:
+      Type: AWS::IAM::User #basic programmer
+      Properties:
+        Groups:
+          - !Ref SysAdmin
+        UserName: Jane
+
+  FinancePolicy: # authorize identity finance related resource including "cost explorer(ce)"  and "budgets"
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: Finance
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+            Action:
+              - budgets:ViewBudget
+              - ce:GetTags
+              - ce:GetDimensionValues
+              - ce:GetReservationCoverage
+              - ce:GetReservationUtilization
+              - ce:GetCostAndUsage
+            Effect: Allow
+            Resource: '*' #todo limit to project/stack resource
+      Groups:
+        - !Ref Finance
+
+  Finance:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: FinanceGroup
+
+  Bob: #typical finance guy
+      Type: AWS::IAM::User
+      Properties:
+        Groups:
+          - !Ref Finance
+        UserName: Bob
+
+  SecurityPolicy: #authorize iam read access
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: Security
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iam:Get*'
+              - 'iam:List*'
+            Resource: '*' #todo limit to project/stack resource
+      Groups:
+        - !Ref Security
+
+  Security:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: SecurityGroup
+
+  Sofia: #typical security lady
+      Type: AWS::IAM::User
+      Properties:
+        Groups:
+          - !Ref Security
+        UserName: Sofia
+
+Outputs:
+  S3Bucket:
+    Description: "Name of S3 bucket"
+    Value: !Ref S3Bucket
+  WebsiteURL:
+    Description: "URL for website hosted on S3"
+    Value: !GetAtt [S3Bucket, WebsiteURL]
