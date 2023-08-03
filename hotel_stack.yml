@@ -30,6 +30,17 @@ Resources:
        - Key: Name
          Value: "Hotel IAM VPC"
 
+  SSHSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: 'pr-ssh-sg'
+      VpcId: !Ref VPC
+      GroupDescription: "Allow SSH inbound and outbound traffic"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
   subnet:
     Type: "AWS::EC2::Subnet"
     Properties:
@@ -88,7 +99,7 @@ Resources:
     Properties:
       BucketName: !Join
       - "-"
-      - - "pr-photo-bucket"
+      - - "public-pr-photo-bucket"
         - !Select
           - 0
           - !Split
@@ -120,21 +131,6 @@ Resources:
           Resource:
             - !Sub "arn:aws:s3:::${S3Bucket}/*"
             - !Sub "arn:aws:s3:::${S3Bucket}"
-  S3Instance:
-    Type: "AWS::EC2::Instance"
-    Properties:
-      InstanceType: t2.micro
-      SubnetId: !Ref subnet
-      IamInstanceProfile: !Ref S3CopyProfile
-      ImageId: !Ref LatestAmiId
-      UserData:
-        Fn::Base64:
-          !Sub |
-          #!/bin/bash -xe
-          export bucket=`aws s3api list-buckets --query "Buckets[].Name" | grep pr-photo-bucket | tr -d ',' | sed -e 's/"//g' | xargs`
-          wget https://aws-tc-largeobjects.s3-us-west-2.amazonaws.com/DEV-AWS-MO-Identity/index.html
-          sed -i "s/<FMI_1>/$bucket/g" index.html
-          aws s3 cp index.html s3://${S3Bucket}/index.html
   #
   S3CopyProfile:
     Type: AWS::IAM::InstanceProfile
@@ -148,6 +144,14 @@ Resources:
       PolicyName: S3CopyPolicy
       PolicyDocument:
         Statement:
+        - Effect: Allow
+          Action:
+          - s3:ListBucket
+          - s3:PutObject
+          - s3:GetObject
+          - s3:PubObjectAcl
+          - s3:ListAllMyBuckets
+          Resource: '*'
         - Effect: Allow
           Action:
           - s3:ListBucket
@@ -288,7 +292,18 @@ Resources:
   S3BucketRaw: #bucket to upload images by employee with specify role
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "${S3Bucket}-raw"
+      BucketName: !Join
+      - "-"
+      - - "private-pr-photo-bucket"
+        - !Select
+          - 0
+          - !Split
+            - "-"
+            - !Select
+              - 2
+              - !Split
+                - "/"
+                - !Ref "AWS::StackId"
   PRLambdaModifierPolicy: #for pr employee to create and modify lambda related resources
     Type: "AWS::IAM::ManagedPolicy"
     Properties:
@@ -320,6 +335,7 @@ Resources:
             Resource: "*"
       Roles:
        - !Ref PRLambdaModifierRole
+       - Ref: S3CopyRole
   LambdaPRResizerRole:
     Type: 'AWS::IAM::Role'
     Properties:
@@ -359,10 +375,10 @@ Resources:
   PRCreateThumbnail:
     Type: AWS::Lambda::Function
     Properties:
-      Runtime: python3.10
+      Runtime: python3.7
       Handler: index.handler
       Role: !GetAtt LambdaPRResizerRole.Arn
-      Timeout: 20
+      Timeout: 15
       Code:
         ZipFile: |
           def handler(event, context):
@@ -374,6 +390,8 @@ Resources:
     Type: "AWS::EC2::Instance"
     Properties:
       InstanceType: t2.micro
+      SecurityGroupIds:
+        - !Ref SSHSecurityGroup
       SubnetId: !Ref subnet
       IamInstanceProfile: !Ref S3CopyProfile
       ImageId: !Ref LatestAmiId
@@ -381,11 +399,19 @@ Resources:
         Fn::Base64:
           !Sub |
           #!/bin/bash -xe
-          export bucket=`aws s3api list-buckets --query "Buckets[].Name" | grep pr-photo-bucket | tr -d ',' | sed -e 's/"//g' | xargs`
+          export bucket=`aws s3api list-buckets --query "Buckets[].Name" | grep public-pr-photo-bucket | tr -d ',' | sed -e 's/"//g' | xargs`
           wget https://aws-tc-largeobjects.s3-us-west-2.amazonaws.com/DEV-AWS-MO-Identity/index.html
           sed -i "s/<FMI_1>/$bucket/g" index.html
-          sed -i 's/s3-us-west-2/${AWS::Region}/g' index.html
+          sed -i 's/s3-us-west-2/s3-${AWS::Region}/g' index.html
           aws s3 cp index.html s3://${S3Bucket}/index.html
+          wget -O CreateThumbnail.zip https://aws-tc-largeobjects.s3-us-west-2.amazonaws.com/DEV-AWS-MO-Identity/CreateThumbnail.zip
+          sudo unzip -p CreateThumbnail.zip CreateThumbnail.py > index.py
+          sed -i "s/'{}-resized'.format(bucket)/'${S3Bucket}'/g" index.py
+          sudo zip -d CreateThumbnail.zip CreateThumbnail.py
+          sudo zip CreateThumbnail.zip index.py
+          export lambda=`aws lambda list-functions --region ca-central-1 --query 'Functions[].FunctionName' | grep PRCreateThumbnail| tr -d ',' | sed -e 's/"//g' | xargs`
+          aws lambda update-function-code --function-name  $lambda --zip-file fileb://CreateThumbnail.zip --region ca-central-1
+          sudo shutdown -h now
 Outputs:
   S3Bucket:
     Description: "Name of S3 bucket"
